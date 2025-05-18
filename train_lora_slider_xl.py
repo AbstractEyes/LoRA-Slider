@@ -637,39 +637,32 @@ def main(args):
             args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_2"
         )
 
-        # Load scheduler and models
-        noise_scheduler = DDPMScheduler.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="scheduler"
-        )
-        text_encoder_one = text_encoder_cls_one.from_pretrained(
-            args.pretrained_model_name_or_path,
-            subfolder="text_encoder",
-            revision=args.revision,
-            variant=args.variant,
-        )
-        text_encoder_two = text_encoder_cls_two.from_pretrained(
-            args.pretrained_model_name_or_path,
-            subfolder="text_encoder_2",
-            revision=args.revision,
-            variant=args.variant,
-        )
-        vae_path = (
-            args.pretrained_model_name_or_path
-            if args.pretrained_vae_model_name_or_path is None
-            else args.pretrained_vae_model_name_or_path
-        )
-        vae = AutoencoderKL.from_pretrained(
-            vae_path,
-            subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None,
-            revision=args.revision,
-            variant=args.variant,
-        )
-        unet = UNet2DConditionModel.from_pretrained(
-            args.pretrained_model_name_or_path,
-            subfolder="unet",
-            revision=args.revision,
-            variant=args.variant,
-        )
+
+    # Load scheduler and models
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    if args.prediction_type is not None:
+        noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+    text_encoder_one = text_encoder_cls_one.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
+    )
+    text_encoder_two = text_encoder_cls_two.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
+    )
+    vae_path = (
+        args.pretrained_model_name_or_path
+        if args.pretrained_vae_model_name_or_path is None
+        else args.pretrained_vae_model_name_or_path
+    )
+    vae = AutoencoderKL.from_pretrained(
+        vae_path,
+        subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None,
+        revision=args.revision,
+        variant=args.variant,
+    )
+    unet = UNet2DConditionModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+    )
+
 
     # We only train the additional adapter LoRA layers
     vae.requires_grad_(False)
@@ -1161,7 +1154,15 @@ def main(args):
                         cross_attention_kwargs={"scale": 0.0},
                     )
 
-                loss = F.mse_loss(trigger_noise.float(), target_noise.float(), reduction="mean")
+                if noise_scheduler.config.prediction_type == "v_prediction":
+                    v_target = noise_scheduler.get_velocity(
+                        latents=denoised_latents,
+                        noise=target_noise,
+                        timesteps=current_timestep,
+                    )
+                    loss = F.mse_loss(trigger_noise.float(), v_target.float(), reduction="mean")
+                else:
+                    loss = F.mse_loss(trigger_noise.float(), target_noise.float(), reduction="mean")
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
