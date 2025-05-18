@@ -146,7 +146,6 @@ def parse_args(input_args=None):
         "--pretrained_model_name_or_path",
         type=str,
         default=None,
-        required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -411,6 +410,12 @@ def parse_args(input_args=None):
     # Sanity checks
     if args.prompt_config_path is None:
         raise ValueError("Need prompt_config_path.")
+    if args.pretrained_model_name_or_path is None and args.pretrained_peft_model_path is None:
+        raise ValueError(
+            "Specify either --pretrained_model_name_or_path or --pretrained_peft_model_path."
+        )
+    if args.pretrained_model_name_or_path is None:
+        args.pretrained_model_name_or_path = args.pretrained_peft_model_path
 
     return args
 
@@ -609,6 +614,8 @@ def main(args):
         tokenizer_one = pipeline.tokenizer
         tokenizer_two = pipeline.tokenizer_2
         noise_scheduler = pipeline.scheduler
+        if args.prediction_type is not None:
+            noise_scheduler.register_to_config(prediction_type=args.prediction_type)
         text_encoder_one = pipeline.text_encoder
         text_encoder_two = pipeline.text_encoder_2
         vae = pipeline.vae
@@ -641,6 +648,8 @@ def main(args):
         noise_scheduler = DDPMScheduler.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="scheduler"
         )
+        if args.prediction_type is not None:
+            noise_scheduler.register_to_config(prediction_type=args.prediction_type)
         text_encoder_one = text_encoder_cls_one.from_pretrained(
             args.pretrained_model_name_or_path,
             subfolder="text_encoder",
