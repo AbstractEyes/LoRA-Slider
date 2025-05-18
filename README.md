@@ -46,6 +46,9 @@ A few example *.json config files have been prepared in ./config folder.
 ```bash
 accelerate launch train_lora_slider.py --pretrained_model_name_or_path runwayml/stable-diffusion-v1-5 --prompt_config_path config/age_slider.json
 ```
+If you have a local sd-scripts LoRA checkpoint you can use `--pretrained_peft_model_path`
+instead of `--pretrained_model_name_or_path`. Pass `--prediction_type v_prediction`
+to enable v-parameterization with v-pred noise loss.
 Note that you need to run `accelerate config` in CLI at the first time.
 The script saves a diffusers LoRA file in the output directory. Pass
 `--save_webui_checkpoint` if you also want a WebUI compatible
