@@ -58,8 +58,11 @@ from diffusers.utils import (
     check_min_version,
     convert_state_dict_to_diffusers,
     convert_unet_state_dict_to_peft,
+    convert_all_state_dict_to_peft,
+    convert_state_dict_to_kohya,
     is_wandb_available,
 )
+from safetensors.torch import load_file, save_file
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
@@ -316,6 +319,11 @@ def parse_args(input_args=None):
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
+    parser.add_argument(
+        "--save_webui_checkpoint",
+        action="store_true",
+        help="Save an additional sd-scripts style LoRA checkpoint in the output directory.",
+    )
     parser.add_argument(
         "--prediction_type",
         type=str,
@@ -598,6 +606,8 @@ def main(args):
 
     # Load scheduler and models
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    if args.prediction_type is not None:
+        noise_scheduler.register_to_config(prediction_type=args.prediction_type)
     text_encoder_one = text_encoder_cls_one.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
     )
@@ -1117,7 +1127,15 @@ def main(args):
                         cross_attention_kwargs={"scale": 0.0},
                     )
 
-                loss = F.mse_loss(trigger_noise.float(), target_noise.float(), reduction="mean")
+                if noise_scheduler.config.prediction_type == "v_prediction":
+                    v_target = noise_scheduler.get_velocity(
+                        latents=denoised_latents,
+                        noise=target_noise,
+                        timesteps=current_timestep,
+                    )
+                    loss = F.mse_loss(trigger_noise.float(), v_target.float(), reduction="mean")
+                else:
+                    loss = F.mse_loss(trigger_noise.float(), target_noise.float(), reduction="mean")
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
@@ -1314,6 +1332,15 @@ def main(args):
                 commit_message="End of training",
                 ignore_patterns=["step_*", "epoch_*"],
             )
+
+        if args.save_webui_checkpoint:
+            diffusers_ckpt = os.path.join(args.output_dir, "pytorch_lora_weights.safetensors")
+            webui_ckpt = os.path.join(args.output_dir, "pytorch_lora_weights_kohya.safetensors")
+            if os.path.isfile(diffusers_ckpt):
+                diff_state = load_file(diffusers_ckpt)
+                peft_state = convert_all_state_dict_to_peft(diff_state)
+                kohya_state = convert_state_dict_to_kohya(peft_state)
+                save_file(kohya_state, webui_ckpt)
 
     accelerator.end_training()
 

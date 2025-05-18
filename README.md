@@ -47,8 +47,11 @@ A few example *.json config files have been prepared in ./config folder.
 accelerate launch train_lora_slider.py --pretrained_model_name_or_path runwayml/stable-diffusion-v1-5 --prompt_config_path config/age_slider.json
 ```
 Note that you need to run `accelerate config` in CLI at the first time.
-
-3.Convert lora file from diffusers🤗 format to webui format for inference if needed.
+The script saves a diffusers LoRA file by default. Pass `--save_webui_checkpoint`
+if you also want a WebUI compatible `pytorch_lora_weights_kohya.safetensors`
+in the output directory.
+Add `--prediction_type v_prediction` to train with velocity prediction.
+If you have other diffusers LoRA files, you can convert them manually:
 ```bash
 python convert_diffusers_sdxl_lora_to_webui.py <input_file> <output_file>
 ```
