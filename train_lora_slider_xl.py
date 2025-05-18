@@ -58,8 +58,11 @@ from diffusers.utils import (
     check_min_version,
     convert_state_dict_to_diffusers,
     convert_unet_state_dict_to_peft,
+    convert_all_state_dict_to_peft,
+    convert_state_dict_to_kohya,
     is_wandb_available,
 )
+from safetensors.torch import load_file, save_file
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
@@ -147,6 +150,12 @@ def parse_args(input_args=None):
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
+        "--pretrained_peft_model_path",
+        type=str,
+        default=None,
+        help="Path to a local sd-scripts (PEFT) SDXL checkpoint to load instead of huggingface model.",
+    )
+    parser.add_argument(
         "--pretrained_vae_model_name_or_path",
         type=str,
         default=None,
@@ -204,6 +213,12 @@ def parse_args(input_args=None):
         type=str,
         default=None,
         help="The directory where the downloaded models and datasets will be stored.",
+    )
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default=None,
+        help="Optional dataset name to include in the generated model card.",
     )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
@@ -316,6 +331,11 @@ def parse_args(input_args=None):
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
+    parser.add_argument(
+        "--save_webui_checkpoint",
+        action="store_true",
+        help="Save an additional sd-scripts style LoRA checkpoint in the output directory.",
+    )
     parser.add_argument(
         "--prediction_type",
         type=str,
@@ -539,6 +559,12 @@ def main(args):
         kwargs_handlers=[kwargs],
     )
 
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
     if args.report_to == "wandb":
         if not is_wandb_available():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
@@ -574,64 +600,82 @@ def main(args):
                 repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
             ).repo_id
 
-    # Load the tokenizers
-    tokenizer_one = AutoTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="tokenizer",
-        revision=args.revision,
-        use_fast=False,
-    )
-    tokenizer_two = AutoTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="tokenizer_2",
-        revision=args.revision,
-        use_fast=False,
-    )
+    if args.pretrained_peft_model_path:
+        pipeline = StableDiffusionXLPipeline.from_single_file(
+            args.pretrained_peft_model_path,
+            torch_dtype=weight_dtype,
+            variant=args.variant,
+        )
+        tokenizer_one = pipeline.tokenizer
+        tokenizer_two = pipeline.tokenizer_2
+        noise_scheduler = pipeline.scheduler
+        text_encoder_one = pipeline.text_encoder
+        text_encoder_two = pipeline.text_encoder_2
+        vae = pipeline.vae
+        unet = pipeline.unet
+        args.pretrained_model_name_or_path = args.pretrained_peft_model_path
+    else:
+        # Load the tokenizers
+        tokenizer_one = AutoTokenizer.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="tokenizer",
+            revision=args.revision,
+            use_fast=False,
+        )
+        tokenizer_two = AutoTokenizer.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="tokenizer_2",
+            revision=args.revision,
+            use_fast=False,
+        )
 
-    # import correct text encoder classes
-    text_encoder_cls_one = import_model_class_from_model_name_or_path(
-        args.pretrained_model_name_or_path, args.revision
-    )
-    text_encoder_cls_two = import_model_class_from_model_name_or_path(
-        args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_2"
-    )
+        # import correct text encoder classes
+        text_encoder_cls_one = import_model_class_from_model_name_or_path(
+            args.pretrained_model_name_or_path, args.revision
+        )
+        text_encoder_cls_two = import_model_class_from_model_name_or_path(
+            args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_2"
+        )
 
-    # Load scheduler and models
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    text_encoder_one = text_encoder_cls_one.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
-    )
-    text_encoder_two = text_encoder_cls_two.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
-    )
-    vae_path = (
-        args.pretrained_model_name_or_path
-        if args.pretrained_vae_model_name_or_path is None
-        else args.pretrained_vae_model_name_or_path
-    )
-    vae = AutoencoderKL.from_pretrained(
-        vae_path,
-        subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None,
-        revision=args.revision,
-        variant=args.variant,
-    )
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
-    )
+        # Load scheduler and models
+        noise_scheduler = DDPMScheduler.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="scheduler"
+        )
+        text_encoder_one = text_encoder_cls_one.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="text_encoder",
+            revision=args.revision,
+            variant=args.variant,
+        )
+        text_encoder_two = text_encoder_cls_two.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="text_encoder_2",
+            revision=args.revision,
+            variant=args.variant,
+        )
+        vae_path = (
+            args.pretrained_model_name_or_path
+            if args.pretrained_vae_model_name_or_path is None
+            else args.pretrained_vae_model_name_or_path
+        )
+        vae = AutoencoderKL.from_pretrained(
+            vae_path,
+            subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None,
+            revision=args.revision,
+            variant=args.variant,
+        )
+        unet = UNet2DConditionModel.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="unet",
+            revision=args.revision,
+            variant=args.variant,
+        )
 
     # We only train the additional adapter LoRA layers
     vae.requires_grad_(False)
     text_encoder_one.requires_grad_(False)
     text_encoder_two.requires_grad_(False)
     unet.requires_grad_(False)
-
-    # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
 
     # Move unet, vae and text_encoder to device and cast to weight_dtype
     # The VAE is in float32 to avoid NaN losses.
@@ -1179,16 +1223,27 @@ def main(args):
                     f" lora_weight={args.validation_lora_weight}"
                 )
                 # create pipeline
-                pipeline = StableDiffusionXLPipeline.from_pretrained(
-                    args.pretrained_model_name_or_path,
-                    vae=vae,
-                    text_encoder=unwrap_model(text_encoder_one),
-                    text_encoder_2=unwrap_model(text_encoder_two),
-                    unet=unwrap_model(unet),
-                    revision=args.revision,
-                    variant=args.variant,
-                    torch_dtype=weight_dtype,
-                )
+                if args.pretrained_peft_model_path:
+                    pipeline = StableDiffusionXLPipeline.from_single_file(
+                        args.pretrained_peft_model_path,
+                        torch_dtype=weight_dtype,
+                        variant=args.variant,
+                    )
+                    pipeline.text_encoder = unwrap_model(text_encoder_one)
+                    pipeline.text_encoder_2 = unwrap_model(text_encoder_two)
+                    pipeline.unet = unwrap_model(unet)
+                    pipeline.vae = vae
+                else:
+                    pipeline = StableDiffusionXLPipeline.from_pretrained(
+                        args.pretrained_model_name_or_path,
+                        vae=vae,
+                        text_encoder=unwrap_model(text_encoder_one),
+                        text_encoder_2=unwrap_model(text_encoder_two),
+                        unet=unwrap_model(unet),
+                        revision=args.revision,
+                        variant=args.variant,
+                        torch_dtype=weight_dtype,
+                    )
 
                 pipeline = pipeline.to(accelerator.device)
                 pipeline.set_progress_bar_config(disable=True)
@@ -1261,13 +1316,20 @@ def main(args):
         if args.mixed_precision == "fp16":
             vae.to(weight_dtype)
         # Load previous pipeline
-        pipeline = StableDiffusionXLPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
-            vae=vae,
-            revision=args.revision,
-            variant=args.variant,
-            torch_dtype=weight_dtype,
-        )
+        if args.pretrained_peft_model_path:
+            pipeline = StableDiffusionXLPipeline.from_single_file(
+                args.pretrained_peft_model_path,
+                torch_dtype=weight_dtype,
+                variant=args.variant,
+            )
+        else:
+            pipeline = StableDiffusionXLPipeline.from_pretrained(
+                args.pretrained_model_name_or_path,
+                vae=vae,
+                revision=args.revision,
+                variant=args.variant,
+                torch_dtype=weight_dtype,
+            )
         pipeline = pipeline.to(accelerator.device)
 
         # load attention processors
@@ -1314,6 +1376,15 @@ def main(args):
                 commit_message="End of training",
                 ignore_patterns=["step_*", "epoch_*"],
             )
+
+        if args.save_webui_checkpoint:
+            diffusers_ckpt = os.path.join(args.output_dir, "pytorch_lora_weights.safetensors")
+            webui_ckpt = os.path.join(args.output_dir, "pytorch_lora_weights_kohya.safetensors")
+            if os.path.isfile(diffusers_ckpt):
+                diff_state = load_file(diffusers_ckpt)
+                peft_state = convert_all_state_dict_to_peft(diff_state)
+                kohya_state = convert_state_dict_to_kohya(peft_state)
+                save_file(kohya_state, webui_ckpt)
 
     accelerator.end_training()
 
